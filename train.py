@@ -77,8 +77,8 @@ with open(args.out_dir + '/init.opt', 'w') as init_opt:
 
 seed_arg = ''
 if args.pred_seed:
-    seed_arg = ' -r 1 '
-    #seed_arg = ' -r 1500 '
+    seed_arg = ' -r 2 '
+    # seed_arg = ' -r 1500 '
 
 
 if (args.alg == 'mert'):

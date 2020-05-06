@@ -21,7 +21,14 @@ import kenlm
 # For edit operations feature
 from lib import levenshtein
 
+# For Bert Score
+from transformers import (AlbertConfig, AlbertForSequenceClassification,
+AlbertTokenizer)
+from transformers.data.processors.utils import InputExample, InputFeatures
+import torch
+
 logger = logging.getLogger(__name__)
+
 
 ln10 = math.log(10)
 class LM:
@@ -54,6 +61,128 @@ class SAMPLE:
 
     def get_score(self, source, candidate, item_idx):
         return str(0.5) 
+
+class BertScore:
+    def __init__(self, name, model_path, model_type):
+        # model_path: dir (c.f. otput_dir in transformers)
+        self.name = name
+        self.model_type = model_type.lower()
+        MODEL_CLASSES = {
+            'albert' : (AlbertConfig, AlbertForSequenceClassification, AlbertTokenizer)
+        }
+
+        # task_name = 'ged-reg'
+        
+        config_class, model_class, tokenizer_class = MODEL_CLASSES[self.model_type]
+        self.tokenizer = tokenizer_class.from_pretrained(
+            model_path,
+            do_lower_case=True # Note!!
+        )
+        self.model = model_class.from_pretrained(
+            model_path
+        )
+
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
+        self.model.eval()
+
+    def _create_example(self, sentence):
+        guid = 'test-{}'.format(sentence)
+        text_a = sentence.strip()
+        example = InputExample(guid=guid, text_a=text_a)
+
+        return example
+
+    def convert_examples_to_features(
+        self,
+        example,
+        tokenizer,
+        max_length=512,
+        task=None,
+        label_list=None,
+        output_mode=None,
+        pad_on_left=False,
+        pad_token=0,
+        pad_token_segment_id=0,
+        mask_padding_with_zero=True,
+    ):
+
+
+        inputs = tokenizer.encode_plus(
+            example.text_a, example.text_b, add_special_tokens=True, max_length=max_length, return_token_type_ids=True,
+        )
+        input_ids, token_type_ids = inputs["input_ids"], inputs["token_type_ids"]
+
+        # The mask has 1 for real tokens and 0 for padding tokens. Only real
+        # tokens are attended to.
+        attention_mask = [1 if mask_padding_with_zero else 0] * len(input_ids)
+
+        # Zero-pad up to the sequence length.
+        padding_length = max_length - len(input_ids)
+        if pad_on_left:
+            input_ids = ([pad_token] * padding_length) + input_ids
+            attention_mask = ([0 if mask_padding_with_zero else 1] * padding_length) + attention_mask
+            token_type_ids = ([pad_token_segment_id] * padding_length) + token_type_ids
+        else:
+            input_ids = input_ids + ([pad_token] * padding_length)
+            attention_mask = attention_mask + ([0 if mask_padding_with_zero else 1] * padding_length)
+            token_type_ids = token_type_ids + ([pad_token_segment_id] * padding_length)
+
+        assert len(input_ids) == max_length, "Error with input length {} vs {}".format(len(input_ids), max_length)
+        assert len(attention_mask) == max_length, "Error with input length {} vs {}".format(
+            len(attention_mask), max_length
+        )
+        assert len(token_type_ids) == max_length, "Error with input length {} vs {}".format(
+            len(token_type_ids), max_length
+        )
+
+        feature = \
+            InputFeatures(
+                input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids
+                )
+
+        return feature
+
+    def make_input(self, sentence):
+        # Load data features from cache or dataset file
+        example = self._create_example(sentence)
+        feature = self.convert_examples_to_features(
+            example,
+            self.tokenizer,
+            max_length=128,
+            pad_on_left=bool(self.model_type in ["xlnet"]),  # pad on the left for xlnet
+            pad_token=self.tokenizer.convert_tokens_to_ids([self.tokenizer.pad_token])[0],
+            pad_token_segment_id=4 if self.model_type in ["xlnet"] else 0,
+        )
+        features = [feature]
+
+
+        # Convert to Tensors and build dataset
+        all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
+        all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
+        all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
+
+        dataset = (all_input_ids, all_attention_mask, all_token_type_ids)
+        return dataset
+
+
+    def get_score(self, source, candidate, item_idx):
+        input_data = self.make_input(candidate.lower())
+        with torch.no_grad():
+            inputs = {'input_ids': input_data[0].to(self.device), \
+                    'attention_mask': input_data[1].to(self.device), \
+                    'token_type_ids': input_data[2].to(self.device)}
+            outputs = self.model(**inputs)
+            logits = float(outputs[0].item())
+        
+        if logits > 1.0: # 1 means error sentence
+            score = 1.0
+        elif logits < 0.0:
+            score = 0.0
+        else:
+            score = logits
+
+        return str(score) 
 
 class WordPenalty:
     '''
@@ -89,7 +218,7 @@ class EditOps:
         s = 0 
         bpointers_sorted = dict()
 
-        for k, v in bpointers.iteritems():
+        for k, v in bpointers.items():
             bpointers_sorted[k] =sorted(v, key=lambda x: x[1][0])
 
         # Traverse the backpointer graph to get the edit ops counts
@@ -266,7 +395,7 @@ class LexWeights:
     def get_score(self, source, candidate, item_idx ):
         aligns = self.align_dict[item_idx]
         if (len(candidate.split())+1, len(source.split())+1) != aligns.shape and (len(candidate.split()), len(source.split())+1) != aligns.shape:
-            print source, candidate, aligns.shape, len(source.split()), len(candidate.split())
+            print (source, candidate, aligns.shape, len(source.split()), len(candidate.split()))
         assert (len(candidate.split())+1, len(source.split())+1) == aligns.shape or (len(candidate.split()), len(source.split())+1) == aligns.shape, "Alignment dimension mismatch at: " + str(item_idx)
         candidate_tokens = candidate.split()
         source_tokens = source.split()
